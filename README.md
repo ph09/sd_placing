@@ -84,4 +84,4 @@ python3 sdplace.py -c config.json annotate HUMAN regions.bed [out.tsv]
 - Tile-filled calls lean old where Cactus aligns to a paralog.
 - Sequence comparison across very deep splits is unreliable (minimap2 asm20 is made for up to ~20%
   divergence); the deepest branches are floors.
-- My scattered scripts were put into a pipeline using AI agents. If you face any issues, please let me know!!
+- My scattered scripts were put into a pipeline using AI agents. If you face any issues, please let me know! Definitely validate results before reporting in any publications! 
