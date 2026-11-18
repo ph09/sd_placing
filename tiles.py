@@ -3,7 +3,6 @@
 """
 import bisect
 import csv
-import random  # noqa: F401  (kept out of the calls: no sampling is used)
 import subprocess
 import sys
 import tempfile
@@ -153,16 +152,9 @@ def queries(cfg):
 
 
 def run_map(cfg, t, threads):
-    out = cfg.d("tiles", "paf") / f"to_{t}.paf"
-    qs = [str(cfg.d("tiles", "queries") / f"{c}.fa") for c in cfg.codes if c != t]
-    with out.with_suffix(".tmp").open("w") as fh, out.with_suffix(".log").open("w") as log:
-        cat = subprocess.Popen(["cat", *qs], stdout=subprocess.PIPE)
-        rc = subprocess.call(["minimap2", "-t", str(threads), "-cx", "asm20", "--secondary=no", str(cfg.fasta[t]), "-"],
-                             stdin=cat.stdout, stdout=fh, stderr=log)
-        cat.wait()
-    if rc:
-        sys.exit(f"minimap2 to {t} exited {rc}")
-    out.with_suffix(".tmp").rename(out)
+    """other genomes' unresolved tiles -> genome t, primary hits with CIGAR"""
+    C.minimap2([cfg.d("tiles", "queries") / f"{c}.fa" for c in cfg.codes if c != t], cfg.fasta[t],
+               cfg.d("tiles", "paf") / f"to_{t}.paf", threads, "-cx", "asm20", "--secondary=no")
 
 
 def mm2calls(cfg):
@@ -308,13 +300,11 @@ def blast(cfg, q, threads):
     wd.rmdir()
     out = cfg.d("tiles", "classified") / f"{q}.tsv"
     with out.with_suffix(".tmp").open("w") as fh:
-        fh.write(COLS + "\tgain\tkind\toldest_possible\tyoungest_possible\n")
+        fh.write(COLS + "\tgain\toldest_possible\tyoungest_possible\n")
         for i, ((c, s, e), st) in enumerate(zip(tiles, sts)):
             g, node, og = place(q, st)
-            lack = [t for t in og if st[t] in LACKING]
-            kind = "" if (g == "unresolved" or not og) else ("source" if any(st[t] in "Aan" for t in lack) else "new")
             lo = cfg.tree.mrca([q] + [t for t in others if st[t] in PRESENT + "U"])
-            fh.write(f"{i}\t{c}\t{s}\t{e}\t{''.join(st[t] for t in others)}\t{g}\t{kind}\t{lo}\t{node}\n")
+            fh.write(f"{i}\t{c}\t{s}\t{e}\t{''.join(st[t] for t in others)}\t{g}\t{lo}\t{node}\n")
     out.with_suffix(".tmp").rename(out)
 
 
