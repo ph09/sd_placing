@@ -16,17 +16,30 @@ MAX_HITS = 300
 HOM_COV = 0.5
 MERGE_GAP = 2_000
 MAX_PER_GENOME, MAX_LEAVES = 60, 150
-MIN_GROUP = 3
+MIN_GROUP = 3                # the duplication must leave >= this many copies in the genome
 CN_STRONG = 3.0              # mean copies under X must also be >= this x the sister max
 CN_RATIO = 1.5               # copy-number guard: mean copies under X >= this x max copies in the sister lineage
 PAIR_MIN_FRAC = 0.3          # all-vs-all: aligned length >= this x shorter sequence, else the pair is "far"
 FAR = 0.3                    # p-distance for pairs that do not align
-ALN_TIMEOUT = 120            # s per segment for the all-vs-all alignment
+ALN_TIMEOUT = 1800           # s per segment for the all-vs-all alignment
+SUBSAMPLE = 15               # > MAX_PER_GENOME / MAX_LEAVES copies: tree from the closest SUBSAMPLE per genome (0 = skip)
+SETTINGS = {"max_per_genome": "MAX_PER_GENOME", "max_leaves": "MAX_LEAVES", "subsample_per_genome": "SUBSAMPLE",
+            "alignment_timeout_s": "ALN_TIMEOUT", "cn_ratio": "CN_RATIO", "cn_strong": "CN_STRONG",
+            "min_group": "MIN_GROUP"}
 NOT_STEPWISE = {"tile", "tile_in_range", "no_homolog", "range", "tile_too_old"}
 
 
 def d(cfg, *p):
     return cfg.d("percopy", *p)
+
+
+def configure(cfg):
+    """config key `percopy` overrides the module defaults above"""
+    for k, v in cfg.percopy.items():
+        if k not in SETTINGS:
+            raise SystemExit(f"config: percopy.{k} unknown; keys: {', '.join(SETTINGS)}")
+        name = SETTINGS[k]
+        globals()[name] = type(globals()[name])(v)
 
 
 # ------------------------------------------------------------------ select
@@ -56,24 +69,28 @@ def select(cfg):
         print(f"[percopy select] {q}: {n} segments, {bp / 1e6:.1f} Mbp", flush=True)
 
 
+MAP_OPTS = ("-x", "asm20", "-N", str(MAX_HITS), "-p", "0.2", "--secondary=yes")
+
+
 def map_to(cfg, t, threads):
-    qs = " ".join(str(d(cfg, "queries") / f"{q}.fa") for q in cfg.codes)
-    out = d(cfg, "paf") / f"to_{t}.paf"
-    subprocess.run(f"cat {qs} | minimap2 -t {threads} -x asm20 -N {MAX_HITS} -p 0.2 --secondary=yes "
-                   f"{cfg.fasta[t]} - > {out}.tmp 2> {out}.log && mv {out}.tmp {out}", shell=True, check=True)
+    """all genomes' segments -> genome t, every hit (homologs)"""
+    C.minimap2([d(cfg, "queries") / f"{q}.fa" for q in cfg.codes], cfg.fasta[t], d(cfg, "paf") / f"to_{t}.paf",
+               threads, *MAP_OPTS)
 
 
 # ------------------------------------------------------------------ trees
-def homologs(cfg, q):
-    """segment -> genome -> [(chrom, start, end)] loci covering >= HOM_COV of the segment"""
+def homologs(cfg, q, paf_dir=None):
+    """segment -> genome -> [(chrom, start, end, identity)] loci covering >= HOM_COV of the segment
+    (identity = matches / aligned bp of the segment's minimap2 hits there)"""
+    paf_dir = paf_dir or d(cfg, "paf")
     hits = defaultdict(lambda: defaultdict(list))
     for t in cfg.codes:
-        with (d(cfg, "paf") / f"to_{t}.paf").open() as fh:
+        with (paf_dir / f"to_{t}.paf").open() as fh:
             for line in fh:
                 if not line.startswith(q + "|"):
                     continue
                 f = line.split("\t", 12)
-                hits[f[0]][(t, f[5])].append((int(f[7]), int(f[8]), int(f[2]), int(f[3])))
+                hits[f[0]][(t, f[5])].append((int(f[7]), int(f[8]), int(f[2]), int(f[3]), int(f[9]), int(f[10])))
     out = {}
     for seg, per in hits.items():
         slen = int(seg.split("|")[3]) - int(seg.split("|")[2])
@@ -81,17 +98,49 @@ def homologs(cfg, q):
         for (t, chrom), hs in per.items():
             hs.sort()
             cur = None
-            for ts, te, qs, qe in hs + [(None, None, None, None)]:
+            for ts, te, qs, qe, m, al in hs + [(None,) * 6]:
                 if ts is not None and cur and ts <= cur[1] + MERGE_GAP:
                     cur[1] = max(cur[1], te)
                     cur[2].append((qs, qe))
+                    cur[3] += m
+                    cur[4] += al
                     continue
                 if cur and sum(b - a for a, b in C.O.merge_iv(cur[2])) >= HOM_COV * slen:
-                    res[t].append((chrom, cur[0], cur[1]))
+                    res[t].append((chrom, cur[0], cur[1], cur[3] / max(cur[4], 1)))
                 if ts is not None:
-                    cur = [ts, te, [(qs, qe)]]
+                    cur = [ts, te, [(qs, qe)], m, al]
         out[seg] = res
     return out
+
+
+def subsample(q, seg, res, k):
+    """closest k loci per genome by identity (the query's own locus always kept), total <= MAX_LEAVES"""
+    _, chrom, s, e = seg.split("|")
+    s, e = int(s), int(e)
+    k = max(1, min(k, MAX_LEAVES // max(1, len(res))))
+    per = {}
+    for t, loci in res.items():
+        loci = sorted(loci, key=lambda x: -x[3])
+        keep = loci[:k]
+        if t == q and not any(c == chrom and a < e and b > s for c, a, b, _ in keep):
+            own = [x for x in loci if x[0] == chrom and x[1] < e and x[2] > s]
+            if own:
+                keep = keep[:-1] + own[:1] if len(keep) >= k else keep + own[:1]
+        per[t] = [(c, a, b) for c, a, b, _ in keep]
+    return per
+
+
+def tree_items(cfg, q, hom):
+    """(segment, loci for the tree, full copy counts, subsampled?) per segment"""
+    items = []
+    for seg, res in hom.items():
+        full = {t: len(res.get(t, [])) for t in cfg.codes}
+        big = max(full.values(), default=0) > MAX_PER_GENOME or sum(full.values()) > MAX_LEAVES
+        if big and SUBSAMPLE:
+            items.append((seg, subsample(q, seg, res, SUBSAMPLE), full, True))
+        else:
+            items.append((seg, {t: [(c, a, b) for c, a, b, _ in v] for t, v in res.items()}, full, False))
+    return items
 
 
 def nj(names, dm):
@@ -200,12 +249,12 @@ def fasta(t):
 
 def _one(item):
     """one segment -> (row, accepted bed row | None); runs in a worker (state in G, set before the fork)"""
-    cfg, q, R, idx, qcalls = G["cfg"], G["q"], G["R"], G["idx"], G["qcalls"]
+    cfg, q, R, qcalls = G["cfg"], G["q"], G["R"], G["qcalls"]
     seg, per = item[:2]
-    full = item[2] if len(item) > 2 else None      # rescue: full copy counts when `per` is a subsample
+    full = item[2] if len(item) > 2 else None      # full copy counts when `per` is a subsample
     _, chrom, s, e = seg.split("|")
     s, e = int(s), int(e)
-    row = dict(segment=seg, chrom=chrom, start=s, end=e)
+    row = dict(segment=seg, chrom=chrom, start=s, end=e, subsampled="yes" if len(item) > 3 and item[3] else "")
     counts = full or {t: len(per.get(t, [])) for t in cfg.codes}
     row["copies"] = ",".join(f"{t}:{counts[t]}" for t in cfg.codes if counts[t])
     # tile/current call of the segment (majority)
@@ -281,43 +330,8 @@ def _one(item):
         if cfg.tree.parent[X] else set()
     g_in, g_sis = sum(counts[t] for t in clade) / len(clade), max((counts[t] for t in sister), default=0)
     row["cn_genome_in_vs_sister"] = f"{g_in:.1f}/{g_sis}"
-    # copy number inside the gene tree: under P, the lowest node above the duplication that holds sister copies,
-    # copies of each genome under X vs separate copy groups of each sister genome (a clade of sister-lineage
-    # copies only counts once, so an independent expansion in the sister lineage does not mask this one)
-    P = parent.get(u)
-    while P is not None and not any(leaf_sp[n] in sister for n in leaves_under(P, kids, set(leaves))):
-        P = parent.get(P)
-    pl = leaves_under(P, kids, set(leaves)) if P is not None else leaves
-    mean_in = sum(1 for n in pl if leaf_sp[n] in clade) / len(clade)
-    groups = Counter()
-
-    def pure(n):
-        lv = leaves_under(n, kids, set(leaves))
-        if all(leaf_sp[x] in sister for x in lv):
-            for t in {leaf_sp[x] for x in lv}:
-                groups[t] += 1
-            return
-        for k in kids.get(n, []):
-            pure(k)
-    if P is not None:
-        pure(P)
-    max_sis = max(groups.values(), default=0)
-    row["cn_in_vs_sister"] = f"{mean_in:.1f}/{max_sis}"
-    # originals: other Q copies under the duplication with a stepwise call older than X
-    orig = 0
-    for n in qcopies:
-        if n == self_leaf:
-            continue
-        _, c2, a, b = seqs[n]
-        cc = Counter()
-        for x, y, lab in C.walk(qcalls, c2, a, b):
-            if lab and lab[1] == "stepwise" and lab[0] in idx and idx[lab[0]] > idx[X]:
-                cc[lab[0]] += y - x
-        if sum(cc.values()) >= 0.5 * (b - a):
-            orig += 1
     row["q_copies_under_dup"] = len(qcopies)
-    row["originals"] = orig
-    st = guard(mean_in, max_sis, g_in, g_sis, orig, len(qcopies))
+    st = guard(g_in, g_sis, len(qcopies))
     row.update(status=st, gain=X if st == "gain" else "")
     return row, ((chrom, s, e, X) if st == "gain" else None)
 
@@ -326,13 +340,12 @@ def _cn_ok(n_in, n_sis):
     return n_in > n_sis and n_in >= CN_RATIO * n_sis
 
 
-def guard(t_in, t_sis, g_in, g_sis, orig, n_q):
-    """status of a duplication on branch X from genome-wide copy numbers (g_: mean copies of the genomes under X vs
-    the sister genome with most): gain when the genomes under X average more copies than, at least 1.5x
-    (CN_RATIO) and at least 3x (CN_STRONG) as many as the sister genome with most, and the duplication left at least
-    MIN_GROUP copies in the genome. Identified originals (orig) and the in-tree count (t_) are recorded but not used:
-    in a test on outgroup-dated SD, gains accepted because another copy was older were too young in 92% of old
-    copies (old paralogs grouped by species in the gene tree pass as a recent duplication)."""
+def guard(g_in, g_sis, n_q):
+    """status of a duplication on branch X from genome-wide copy numbers (g_in: mean copies of the genomes under X,
+    g_sis: the sister genome with most): gain when g_in > g_sis, g_in >= CN_RATIO x and >= CN_STRONG x g_sis, and
+    the duplication left at least MIN_GROUP copies in the genome (n_q). Whether another copy of the family is dated
+    older is not used: in a test on outgroup-dated SD, gains accepted that way were too young in 92% of old copies
+    (old paralogs grouped by species in the gene tree pass as a recent duplication)."""
     if not _cn_ok(g_in, g_sis):
         return "rejected_copy_number"
     if n_q < MIN_GROUP:
@@ -350,9 +363,8 @@ def restatus(cfg, q):
     bed, n = [], Counter()
     for r in rows:
         if r["status"] in ("gain", "rejected_copy_number", "ambiguous_pair", "weak_no_original", "weak_copy_number"):
-            t_in, t_sis = map(float, r["cn_in_vs_sister"].split("/"))
             g_in, g_sis = map(float, r["cn_genome_in_vs_sister"].split("/"))
-            st = guard(t_in, t_sis, g_in, g_sis, int(r["originals"]), int(r["q_copies_under_dup"]))
+            st = guard(g_in, g_sis, int(r["q_copies_under_dup"]))
             r["status"], r["gain"] = st, r["dup_branch"] if st == "gain" else ""
             if st == "gain":
                 bed.append((r["chrom"], int(r["start"]), int(r["end"]), r["dup_branch"]))
@@ -371,24 +383,25 @@ def restatus(cfg, q):
 def trees(cfg, q, threads):
     import multiprocessing as mp
     import combine as CB
-    G.update(cfg=cfg, q=q, R=Recon(cfg), idx={n: i for i, n in enumerate(cfg.path_to_root(q))},
-             # current (no-copy) calls of Q, to recognise originals (stepwise-dated older copies)
+    G.update(cfg=cfg, q=q, R=Recon(cfg),
+             # current (no-copy) calls of Q: column `current`
              qcalls=C.track([(c, x, y, (b, src)) for c, x, y, b, src, lo, hi in
                              CB.combined_rows(cfg, q, use_copy=False)]),
              tmp=tempfile.mkdtemp(dir=d(cfg, "tmp")))
-    hom = homologs(cfg, q)
-    print(f"[percopy trees] {q}: {len(hom)} segments with homologs, {threads} workers", flush=True)
+    items = tree_items(cfg, q, homologs(cfg, q))
+    print(f"[percopy trees] {q}: {len(items)} segments with homologs ({sum(x[3] for x in items)} subsampled), "
+          f"{threads} workers", flush=True)
     out_rows, bed = [], []
     with mp.get_context("fork").Pool(threads) as pool:
-        for n, (row, b) in enumerate(pool.imap_unordered(_one, hom.items(), chunksize=4)):
+        for n, (row, b) in enumerate(pool.imap_unordered(_one, items, chunksize=4)):
             out_rows.append(row)
             if b:
                 bed.append(b)
             if n % 1000 == 0:
-                print(f"[percopy trees] {q}: {n}/{len(hom)}", flush=True)
+                print(f"[percopy trees] {q}: {n}/{len(items)}", flush=True)
     out_rows.sort(key=lambda r: (r["chrom"], r["start"]))
     cols = ["segment", "chrom", "start", "end", "current", "copies", "status", "gain", "dup_branch",
-            "cn_in_vs_sister", "cn_genome_in_vs_sister", "q_copies_under_dup", "originals"]
+            "cn_genome_in_vs_sister", "q_copies_under_dup", "subsampled"]
     o = d(cfg, "calls") / f"{q}.tsv"
     with o.with_suffix(".tmp").open("w") as fh:
         fh.write("\t".join(cols) + "\n")
@@ -420,6 +433,7 @@ def main():
     ap.add_argument("args", nargs="*")
     a = ap.parse_args()
     cfg = C.load(a.config)
+    configure(cfg)
     if a.cmd == "select":
         select(cfg)
     elif a.cmd == "map":
