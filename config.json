@@ -1,0 +1,40 @@
+{
+    "hal": "hominines.hal",
+    "outdir": "sdplace_out",
+    "hal_command_prefix": [""],
+    "tree": "(GORILLA,(HUMAN,CHIMP)Hominini)Homininae;",
+    "minimap2_anchor_clades": ["Homininae"],
+    "asm20_clades": ["Homininae"],
+    "threads": 16,
+    "slurm": {
+      "partition": "normal",
+      "max_parallel": 20,
+      "extra_args": []
+    },
+    "species": {
+      "HUMAN": {
+        "genome": "T2T_Homo_sapiens.pri",
+        "fasta": "genomes/T2T_Homo_sapiens.pri.fasta",
+        "sedef": "sedef/HUMAN.SDs.bed",
+        "exclude_chroms": ["chrY"]
+      },
+      "CHIMP": {
+        "genome": "T2T_Pan_troglodytes.pri",
+        "fasta": "genomes/T2T_Pan_troglodytes.pri.fasta",
+        "sedef": "sedef/CHIMP.SDs.bed"
+      },
+      "GORILLA": {
+        "genome": "T2T_Gorilla_gorilla.pri",
+        "fasta": "genomes/T2T_Gorilla_gorilla.pri.fasta",
+        "sedef": "sedef/GORILLA.SDs.bed"
+      }
+    },
+    "tile_age_cap": {
+      "node_ages_my": {
+        "Hominini": 6.46,
+        "Homininae": 8.72
+      },
+      "substitution_rate_per_site_per_my": 0.001,
+      "margin": 2
+    }
+  }
