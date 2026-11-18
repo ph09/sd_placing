@@ -150,6 +150,52 @@ def parse_newick(s: str):
     return t
 
 
+def newick_ages(s: str):
+    """node -> age (time units of the branch lengths, e.g. My) from a Newick string with branch lengths on every
+    branch below the root; leaves are age 0, a node is the mean over its children of child age + branch length
+    (the same for every child on an ultrametric tree). Node names as parse_newick. None if any length is missing."""
+    s = s.strip().rstrip(";")
+    pos = 0
+
+    def length():
+        nonlocal pos
+        m = re.match(r":([0-9.eE+-]+)", s[pos:])
+        if not m:
+            return None
+        pos += len(m.group(0))
+        return float(m.group(1))
+
+    def node():
+        nonlocal pos
+        kids = []
+        if s[pos] == "(":
+            pos += 1
+            kids.append(node())
+            while s[pos] == ",":
+                pos += 1
+                kids.append(node())
+            pos += 1
+        m = re.match(r"[^(),;:]*", s[pos:])
+        name = m.group(0).strip()
+        pos += len(m.group(0))
+        bl = length()
+        if not kids:
+            return name, [name], {name: 0.0}, bl
+        if not name or re.fullmatch(r"[0-9.]+", name):
+            name = "+".join(sorted(x for k in kids for x in k[1]))
+        ages = {}
+        for k in kids:
+            ages.update(k[2])
+        if any(k[3] is None for k in kids):
+            ages[name] = None
+        else:
+            ages[name] = sum(k[2][k[0]] + k[3] for k in kids if k[2][k[0]] is not None) / len(kids)
+        return name, [x for k in kids for x in k[1]], ages, bl
+
+    ages = node()[2]
+    return None if any(v is None for v in ages.values()) else ages
+
+
 class Tree:
     def __init__(self, node) -> None:
         self.parent: dict[str, str | None] = {}
