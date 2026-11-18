@@ -48,16 +48,27 @@ class Cfg(O.Config):
         # combine: undated runs of <= this many bp between two identical dated calls take that call (0 = off)
         self.gap_fill = int(c.get("gap_fill_max_bp", 0))
         # identity age cap for tile calls (combine.py); absent = tile calls are always used
+        # node ages: tile_age_cap.node_ages_my, else the tree's branch lengths (My, ultrametric)
         cap = c.get("tile_age_cap")
         self.age_cap = None
-        if cap:
-            ages = {n: float(v) for n, v in cap["node_ages_my"].items()}
+        if cap is not None:
+            if "node_ages_my" in cap:
+                ages = {n: float(v) for n, v in cap["node_ages_my"].items()}
+            else:
+                ages = O.newick_ages(c["tree"])
+                if ages is None:
+                    raise SystemExit("config: tile_age_cap needs node_ages_my, or branch lengths (My) on every branch "
+                                     "of the tree")
             for n in self.tree.parent:
                 if n not in self.species and n not in ages:
                     raise SystemExit(f"config: tile_age_cap.node_ages_my has no age for node '{n}'")
             ages.update({x: 0.0 for x in self.species})
             self.age_cap = dict(ages=ages, rate=float(cap.get("substitution_rate_per_site_per_my", 0.001)),
                                 margin=float(cap.get("margin", 2.0)))
+        # per-copy settings (percopy.configure); unknown keys are an error
+        self.percopy = dict(c.get("percopy", {}))
+        # regions whose calls are flagged (kept, reported separately): species.<CODE>.flag_regions BED
+        self.flag_regions = {code: p(s["flag_regions"]) for code, s in c["species"].items() if s.get("flag_regions")}
         self.identity_col = int(c.get("sedef_identity_column", 24))          # 1-based; SEDEF fracMatch
         self.slurm = c.get("slurm", {})
         self.root = next(n for n, par in self.tree.parent.items() if par is None)
@@ -194,9 +205,22 @@ def hal_liftover(cfg, q, bed, t, out, no_dupes=True) -> bool:
     return False
 
 
+def minimap2(queries, target, out, threads, *opts):
+    """cat queries | minimap2 -t threads opts target - > out (.tmp, then renamed; stderr in out.log)"""
+    out = Path(out)
+    with out.with_suffix(".tmp").open("w") as fh, out.with_suffix(".log").open("w") as log:
+        cat = subprocess.Popen(["cat", *map(str, queries)], stdout=subprocess.PIPE)
+        rc = subprocess.call(["minimap2", "-t", str(threads), *opts, str(target), "-"], stdin=cat.stdout, stdout=fh,
+                             stderr=log)
+        cat.wait()
+    if rc:
+        raise SystemExit(f"minimap2 to {target} exited {rc}")
+    out.with_suffix(".tmp").rename(out)
+
+
 def mbp(x) -> str:
     return f"{x / 1e6:.2f}"
 
 
 __all__ = ["Cfg", "load", "sd_by_chrom", "sd_index", "sd_pieces", "loci", "units", "track", "walk", "hal_liftover",
-           "mbp", "Counter", "defaultdict", "O"]
+           "minimap2", "mbp", "Counter", "defaultdict", "O"]
