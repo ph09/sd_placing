@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Combined SD age: the stepwise call where it resolves a branch, the tile call where it cannot.
+"""Combined SD age. It uses the stepwise call where it resolves a branch, and the tile call where it cannot.
 """
 import csv
 import sys
@@ -118,15 +118,12 @@ def _copy_rows(cfg, q, use_copy=True):
     if use_copy:
         import percopy
         ct = percopy.copy_track(cfg, q)
-    if ct is None:
-        yield from _base_rows(cfg, q)
-        return
     idx = {n: i for i, n in enumerate(cfg.path_to_root(q))}
-    for c, x, y, b, src, lo, hi in _base_rows(cfg, q, ranges=True):
-        if src == "stepwise":
-            yield c, x, y, b, src, lo, hi
+    for c, x, y, b, src, lo, hi in _base_rows(cfg, q):
+        shown = (lo, hi) if b == "undated" else (b, b)      # dated rows are written with youngest = oldest = branch
+        if src == "stepwise" or ct is None:
+            yield c, x, y, b, src, *shown
             continue
-        shown = (lo, hi) if b == "undated" else (b, b)
         for x2, y2, X in C.walk(ct, c, x, y):
             ok = X is not None and X in idx and idx[lo] <= idx[X] <= idx[hi] and (b == "undated" or idx[X] < idx[b])
             if ok:
@@ -135,10 +132,10 @@ def _copy_rows(cfg, q, use_copy=True):
                 yield c, x2, y2, b, src, *shown
 
 
-def _base_rows(cfg, q, ranges=False):
+def _base_rows(cfg, q):
     """yield (chrom, start, end, branch | 'undated', source, youngest, oldest) over Q's SD.
-    youngest/oldest of a tile call is the tile branch, or with ranges=True the range the stepwise walk allows
-    (combined_rows needs it to place a younger per-copy call).
+    youngest/oldest: the range the stepwise walk allows (for a tile call too: _copy_rows needs it to place a
+    younger per-copy call).
     Undated sources: no_homolog, range, tile_too_old (a tile call older than the base's most diverged SEDEF paralog
     allows, see too_old: Cactus can align a recent copy to an older paralog, which dates it too old)."""
     path = cfg.path_to_root(q)
@@ -161,9 +158,28 @@ def _base_rows(cfg, q, ranges=False):
                             if d is not None and too_old(cfg, t, d):
                                 yield c, x3, y3, "undated", "tile_too_old", lo, hi
                             else:
-                                yield c, x3, y3, t, src, *((lo, hi) if ranges else (t, t))
+                                yield c, x3, y3, t, src, lo, hi
                     else:
                         yield c, x2, y2, "undated", und, lo, hi
+
+
+def flag_track(cfg, q):
+    """species.<q>.flag_regions BED (merged) as a track, or None. Calls there are kept and reported separately."""
+    f = cfg.flag_regions.get(q)
+    if not f:
+        return None
+    by = defaultdict(list)
+    with open(f) as fh:
+        for line in fh:
+            if not line.strip() or line.startswith(("#", "track", "browser")):
+                continue
+            x = line.split("\t")
+            by[x[0]].append((int(x[1]), int(x[2])))
+    return C.track([(c, a, b, True) for c, v in by.items() for a, b in C.O.merge_iv(v)])
+
+
+def flagged_bp(ft, c, a, b):
+    return sum(y - x for x, y, l in C.walk(ft, c, a, b) if l) if ft else 0
 
 
 UNIT_GAPS = {"units_5kb": 5_000, "units_100kb": 100_000}
@@ -194,14 +210,17 @@ def unit_counts(cfg, q):
 
 def combine(cfg):
     tree = cfg.tree
-    prof, young = defaultdict(Counter), defaultdict(Counter)
+    prof, young, flag = defaultdict(Counter), defaultdict(Counter), defaultdict(Counter)
     for q in cfg.codes:
         out = cfg.d("results", "combined") / f"{q}.tsv"
+        ft = flag_track(cfg, q)
         with out.with_suffix(".tmp").open("w") as fh:
             fh.write("chrom\tstart\tend\tbranch\tsource\tyoungest\toldest\n")
             for c, x, y, b, src, lo, hi in combined_rows(cfg, q):
                 fh.write(f"{c}\t{x}\t{y}\t{b}\t{src}\t{lo}\t{hi}\n")
                 prof[q][(b, src)] += y - x
+                if ft:
+                    flag[q][b] += flagged_bp(ft, c, x, y)
                 if b == "undated":
                     young[q][lo] += y - x
         out.with_suffix(".tmp").rename(out)
@@ -212,7 +231,7 @@ def combine(cfg):
         fh.write("branch\tn_genomes\tstepwise_mbp\ttile_fill_no_homolog_mbp\ttile_fill_in_range_mbp\tcopy_mbp\tgap_fill_mbp\t"
                  "combined_mbp\t"
                  "undated_youngest_here_mbp\tcombined_upper_mbp\t" +
-                 "\t".join(f"{k}\t{k}_kbp_each" for k in UNIT_GAPS) + "\n")
+                 "\t".join(f"{k}\t{k}_kbp_each" for k in UNIT_GAPS) + "\tflagged_mbp\tcombined_unflagged_mbp\n")
         for n in nodes:
             desc = sorted(tree.leaves_of[n] & set(cfg.codes))
             if not desc:
@@ -226,13 +245,14 @@ def combine(cfg):
                 nu = sum(units[q][0][kind][n] for q in desc) / len(desc)
                 ub = sum(units[q][1][kind][n] for q in desc) / len(desc)
                 uc += [f"{nu:.1f}", f"{ub / nu / 1e3:.1f}" if nu else ""]
+            fl = sum(flag[q][n] for q in desc) / k
             fh.write(f"{n}\t{len(desc)}\t{a:.2f}\t{b:.2f}\t{c:.2f}\t{cp:.2f}\t{gf:.2f}\t{a + b + c + cp + gf:.2f}\t{u:.2f}\t"
                      f"{a + b + c + cp + gf + u:.2f}\t"
-                     + "\t".join(uc) + "\n")
+                     + "\t".join(uc) + f"\t{fl:.2f}\t{a + b + c + cp + gf - fl:.2f}\n")
     with (cfg.d("results") / "combined_genome.tsv").open("w") as fh:
         fh.write("genome\tsd_mbp\tspecific_stepwise\tspecific_tile_fill\tspecific_combined\tshared_stepwise\t"
                  "shared_tile_fill\tshared_combined\tundated_range\tundated_no_homolog\tundated_tile_too_old\t"
-                 "undated_pct\n")
+                 "undated_pct\tspecific_flagged\tshared_flagged\tundated_flagged\n")
         for q in cfg.codes:
             p = prof[q]
             tot = sum(p.values())
@@ -241,8 +261,10 @@ def combine(cfg):
             hs = sum(v for (b, s), v in p.items() if s == "stepwise" and b != q)
             ht = sum(v for (b, s), v in p.items() if (s.startswith("tile") or s in ("copy", "gap_fill")) and b != q and b != "undated")
             ur, un, upar = p[("undated", "range")], p[("undated", "no_homolog")], p[("undated", "tile_too_old")]
+            fs, fu = flag[q][q], flag[q]["undated"]
             fh.write("\t".join([q] + [C.mbp(v) for v in (tot, ss, st, ss + st, hs, ht, hs + ht, ur, un, upar)]
-                               + [f"{100 * (ur + un + upar) / tot:.0f}"]) + "\n")
+                               + [f"{100 * (ur + un + upar) / tot:.0f}"]
+                               + [C.mbp(v) for v in (fs, sum(flag[q].values()) - fs - fu, fu)]) + "\n")
     print((cfg.d("results") / "combined_branch.tsv").read_text())
 
 
@@ -263,19 +285,24 @@ def per_sd(cfg):
                         v = ann(c, a, b)
                         fh.write(f"{c}\t{a}\t{b}\t{sdbp}\t" + "\t".join(v) + "\n")
                         n[v[3]] += 1
+                        if v[-1] and int(v[-1]) >= 50:
+                            n[v[3] + "_flagged"] += 1
             summary.append((q, kind, n))
         print(f"[per-sd] {q}", flush=True)
     with (out_dir / "summary.tsv").open("w") as fh:
-        fh.write("genome\tunit\tn\tspecies_specific\tshared\tundated\n")
+        fh.write("genome\tunit\tn\tspecies_specific\tshared\tundated\tspecies_specific_flagged\tshared_flagged\t"
+                 "undated_flagged\n")
         for q, kind, n in summary:
-            fh.write(f"{q}\t{kind}\t{sum(n.values())}\t{n['species_specific']}\t{n['shared']}\t{n['undated']}\n")
+            fh.write(f"{q}\t{kind}\t{n['species_specific'] + n['shared'] + n['undated'] + n['not_sd']}\t"
+                     f"{n['species_specific']}\t{n['shared']}\t{n['undated']}\t{n['species_specific_flagged']}\t"
+                     f"{n['shared_flagged']}\t{n['undated_flagged']}\n")
     print((out_dir / "summary.tsv").read_text())
 
 
 # ------------------------------------------------------------------ annotate regions (e.g. SEDEF rows)
 MIN_DATED = 0.5      # a region gets a main branch only when at least this share of its called bp is dated
 ANN = ("bp\tcalled_bp\tdated_pct\tclass\tmain_branch\tmain_pct_of_dated\tbranch_genomes\tspecies_specific_pct\t"
-       "shared_pct\tundated_pct\tstepwise_pct\ttile_pct\tcopy_pct\tgap_fill_pct\tsecond_branch\tbranches")
+       "shared_pct\tundated_pct\tstepwise_pct\ttile_pct\tcopy_pct\tgap_fill_pct\tsecond_branch\tbranches\tflagged_pct")
 N_ANN = len(ANN.split("\t"))
 
 
@@ -285,19 +312,23 @@ class Annotator:
     class: 'undated' when < MIN_DATED of called_bp is dated (main_branch then blank; `branches` still lists the
     dated part), else species_specific or shared, whichever holds more bp; 'not_sd' without called bp.
     stepwise_pct / tile_pct / copy_pct: share of called bp dated by each method (tile = tile and tile_in_range;
-    copy = per-copy gene-tree call, percopy.py; gap_fill = short undated run between identical calls)."""
+    copy = per-copy gene-tree call, percopy.py; gap_fill = short undated run between identical calls).
+    flagged_pct: share of called bp inside the genome's flag_regions (blank without them)."""
 
     def __init__(self, cfg, q):
         self.cfg, self.q = cfg, q
         self.tr = C.track([(r["chrom"], int(r["start"]), int(r["end"]), (r["branch"], r["source"])) for r in
                            csv.DictReader((cfg.d("results", "combined") / f"{q}.tsv").open(), delimiter="\t")])
+        self.ft = flag_track(cfg, q)
 
     def __call__(self, c, a, b):
         per, src = Counter(), Counter()
+        fl = 0
         for x, y, lab in C.walk(self.tr, c, a, b):
             if lab is not None:
                 per[lab[0]] += y - x
                 src[lab[1]] += y - x
+                fl += flagged_bp(self.ft, c, x, y)
         called = sum(per.values())
         if not called:
             return [str(b - a), "0", "", "not_sd"] + [""] * (N_ANN - 4)
@@ -317,7 +348,7 @@ class Annotator:
                 pc(spec), pc(shared), pc(und), pc(src["stepwise"]), pc(src["tile"] + src["tile_in_range"]), pc(src["copy"]),
                 pc(src["gap_fill"]),
                 (top[1][0] if len(top) > 1 else "") if main else "",
-                ",".join(f"{k}:{v}" for k, v in per.most_common())]
+                ",".join(f"{k}:{v}" for k, v in per.most_common()), pc(fl) if self.ft else ""]
 
 
 def annotate_file(cfg, q, path, out):
