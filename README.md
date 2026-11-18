@@ -1,7 +1,6 @@
 # sdplace
 
-Dates segmental duplications (SDs) on a species tree: for every SD base of every genome, the branch on
-which that sequence became SD.
+Dates segmental duplications (SDs) on a species tree. For every SD base of every genome, it is assigned to the branch on which that sequence most likely became SD.
 
 Inputs
 - A Cactus HAL containing every genome.
@@ -20,12 +19,14 @@ Copy `config.example.json` and edit it. Relative paths are relative to the confi
 |---|---|
 | `hal`, `outdir`, `tree` | The alignment, output directory, the species tree |
 | `hal_command_prefix` | Command prefix for the HAL tools |
-| `species.<CODE>` | `genome` (name in the HAL), `fasta`, `sedef`, optional `chrom_map`, `exclude_chroms` (e.g. chrY) |
+| `species.<CODE>` | `genome` (name in the HAL), `fasta`, `sedef`, optional `chrom_map`, `exclude_chroms` (e.g. chrY), `flag_regions` (see below) |
 | `minimap2_anchor_clades` | Tree nodes inside which unlifted rescue anchors may be placed with minimap2. Use nodes whose genomes are within about 10 My of each other (sister species, a genus). Default: none (Cactus only) |
 | `asm20_clades` | Tree nodes inside which SD is aligned with minimap2 asm20 (up to roughly 20% divergence); other pairs use masked blastn. Default: minimap2 for every pair |
 | `blast_priority` | Optional order in which outgroup genomes are tried in the tile blastn stage (default: config order) |
-| `tile_age_cap` | Optional: `node_ages_my` (age of every internal node), `substitution_rate_per_site_per_my` (default 0.001), `margin` (default 2). A tile call is set aside (undated, `tile_too_old`) when its branch is entirely older than margin x (1 - identity) / (2 x rate) My, using the base's most diverged SEDEF paralog. Without it, tile calls are always used |
+| `tile_age_cap` | Recommended. `node_ages_my` (age of every internal node; if left out, ages come from the tree's branch lengths, which must then be in My on every branch), `substitution_rate_per_site_per_my` (default 0.001), `margin` (default 2). A tile call is set aside (undated, `tile_too_old`) when its branch is entirely older than margin x (1 - identity) / (2 x rate) My, using the base's most diverged SEDEF paralog. `"tile_age_cap": {}` with a dated tree is enough. Without it, tile calls are always used, and they lean old where Cactus aligns a copy to a paralog (in a primate set, human SD pairs at >= 99% identity with both copies called old fell from 1,034 to 418 with the cap; known-age loci were unaffected) |
 | `sedef_identity_column` | Column of the SEDEF files holding pair identity (default 24, SEDEF `fracMatch`) |
+| `gap_fill_max_bp` | Optional (default 0 = off): in `combine`, an undated run of at most this many bp that touches the same dated call on both sides takes that call (source `gap_fill`). In a holdout of dated sequence the flanking call matched 98% of bases at 2 kbp and 95% at 10 kbp. 2000 is a safe setting; 10000 dates more, but terminal gap-fill calls were weak in a check against published human-specific SDs |
+| `percopy` | Optional overrides of the per-copy settings: `max_per_genome` (60), `max_leaves` (150), `subsample_per_genome` (15; 0 = skip large families instead), `alignment_timeout_s` (1800), `cn_ratio` (1.5), `cn_strong` (3), `min_group` (3). The defaults were checked on primates only |
 | `threads` | CPUs for the multi-threaded tasks |
 | `slurm` | `partition`, `max_parallel`, `extra_args` (list of extra `sbatch` arguments) |
 
@@ -53,7 +54,8 @@ With `--slurm` the driver waits for each array, so you might want to submit it a
 | `rescue_anchors`, `rescue_lift`, `rescue_mm2`, `rescue_homologs` | Loci whose flanks do not lift (satellite): outer windows walking out to 1 Mbp and interior non-SD gaps, lifted with Cactus, minimap2 only inside `minimap2_anchor_clades` | `stepwise/rescue/`, `stepwise/homologs_rescue.tsv` |
 | `align` | Each genome's SD aligned to the SD inside each homolog (minimap2 asm20 or masked blastn) | `stepwise/aln/` |
 | `place` | Stepwise call per base, walking from the genome to the root | `stepwise/placed/`, `stepwise/stepwise_genome.tsv` |
-| `combine` | Stepwise call where resolved, tile call otherwise | `results/` |
+| `percopy_select`, `percopy_map`, `percopy_trees` | Per-copy dating of SD the stepwise walk leaves to tiles (see below) | `percopy/` |
+| `combine` | Stepwise call where resolved, then the per-copy call where accepted, then the tile call, then gap fill if set | `results/` |
 | `per_sd` | One row per SD (merged interval and unit): species-specific, shared or undated | `results/per_sd/` |
 
 ## Results
@@ -82,4 +84,4 @@ python3 sdplace.py -c config.json annotate HUMAN regions.bed [out.tsv]
 - Tile-filled calls lean old where Cactus aligns to a paralog.
 - Sequence comparison across very deep splits is unreliable (minimap2 asm20 is made for up to ~20%
   divergence); the deepest branches are floors.
-- These scripts were put into a pipeline using AI agents. If you face any issues, please let me know!
+- My scattered scripts were put into a pipeline using AI agents. If you face any issues, please let me know!!
